@@ -1,0 +1,32 @@
+# Keep the build context small + deterministic.
+
+# VCS
+.git
+.gitignore
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+backend/.venv/
+backend/.pytest_cache/
+
+# Node (rebuilt inside the image)
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Local app data + logs
+data/
+*.log
+
+# Docs / infra not needed at runtime
+*.md
+docs/
+.vscode/
+.idea/
+.DS_Store

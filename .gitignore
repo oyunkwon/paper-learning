@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# --- Node / frontend ---
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# --- Secrets / env ---
+.env
+.env.*
+!.env.example
+
+# --- Local app data (sessions cache, uploads, retrieval cache) ---
+# The method-2 cache dir when TUTOR_DATA_DIR points inside the repo.
+data/
+*.sqlite
+*.sqlite3
+
+# --- Logs ---
+logs/
+*.log
+
+# --- OS / editor ---
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
