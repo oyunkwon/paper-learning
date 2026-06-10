@@ -33,6 +33,7 @@ class FakeLLMClient:
     def __init__(self, chunks: list[str]) -> None:
         self._chunks = chunks
         self.last_messages: list[dict[str, Any]] | None = None
+        self.last_stop: list[str] | None = None
 
     async def stream(
         self,
@@ -41,8 +42,10 @@ class FakeLLMClient:
         messages: list[dict[str, Any]],
         temperature: float = 0.4,
         max_tokens: int | None = None,
+        stop: list[str] | None = None,
     ) -> AsyncIterator[str]:
         self.last_messages = messages
+        self.last_stop = stop
         for c in self._chunks:
             yield c
 
@@ -214,6 +217,47 @@ async def test_self_dialogue_is_cut():
     assert "독립 벡터들의 모임" not in text
     # 컷 이후의 CONCEPT_DONE은 적용되지 않는다.
     assert chapter["conceptsDone"][0] is False
+
+
+async def test_self_dialogue_labelless_is_cut():
+    # 실제 버그 재현: 모델이 "직접 구해봐"로 학습자에게 차례를 넘긴 뒤, 화자
+    # 레이블 없이 곧장 정답·풀이를 이어 쓰고 스스로 채점한다. 레이블이 없어
+    # 기존 _SPEAKER_LABEL_RE로는 못 잡던 케이스다.
+    chunks = [
+        "<<TEACHING:p1:0>>\n",
+        "특성방정식을 세우고 고유값을 직접 구해봐.\n",
+        "\n",
+        "맞아, characteristic polynomial은 (4−λ)(3−λ)−2·1 = λ²−7λ+10 "
+        "= (λ−2)(λ−5), 그래서 λ=2,5.\n",   # 절대 새어나오면 안 됨
+        "<<CONCEPT_DONE:p1:0>>",
+    ]
+    frames, _curr, chapter, _changes, _client = await _run(chunks, "prereq", "p1")
+    text = _tokens(frames)
+    assert "직접 구해봐" in text
+    assert "characteristic polynomial" not in text
+    assert "λ=2,5" not in text
+    assert chapter["conceptsDone"][0] is False
+
+
+async def test_legit_tutor_turn_with_rhetorical_question_not_cut():
+    # 오탐 방지: 한 턴 안에서 수사적 질문 뒤 곧바로 설명을 이어가는 정상 흐름은
+    # 자르지 않는다(빈 줄 분리도, 채점 표현도 없음).
+    chunks = [
+        "<<TEACHING:p1:0>>\n",
+        "기저가 왜 중요할까? 그건 벡터공간의 모든 원소를 유일하게 표현하기\n",
+        "때문이야. 자, 그럼 $\\mathbb{R}^2$의 기저를 하나 말해볼래?",
+    ]
+    frames, _curr, chapter, _changes, _client = await _run(chunks, "prereq", "p1")
+    text = _tokens(frames)
+    assert "유일하게 표현" in text
+    assert "기저를 하나 말해볼래?" in text
+
+
+async def test_stop_sequences_forwarded_to_client():
+    chunks = ["<<TEACHING:p1:0>>\n", "기저를 설명할게."]
+    _frames, _curr, _ch, _changes, client = await _run(chunks, "prereq", "p1")
+    assert client.last_stop, "stop 시퀀스가 client.stream으로 전달돼야 한다"
+    assert any("학습자" in s for s in client.last_stop)
 
 
 async def test_degenerate_loop_is_cut():

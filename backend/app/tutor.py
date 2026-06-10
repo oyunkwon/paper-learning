@@ -74,6 +74,42 @@ _SPEAKER_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# API 레벨 정지 시퀀스. 모델이 화자 레이블로 가상 학습자 턴을 열기 시작하면 그
+# 시점에 생성을 물리적으로 멈춘다(_SpeakerLabelGuard의 1차 방어). 줄 시작
+# 레이블만 노리도록 앞에 개행을 둔다 — 본문 중간의 "user 입력" 같은 정상 단어는
+# 건드리지 않는다. provider별로 best-effort라 가드를 폐기하지 않고 병행한다.
+_STOP_SEQUENCES = [
+    "\n학습자:",
+    "\n학습자 :",
+    "\n학생:",
+    "\n튜터:",
+    "\nuser:",
+    "\nUser:",
+    "\nassistant:",
+    "\n사용자:",
+]
+
+# 라벨 없는 자문자답 가드. 모델이 질문을 던진 뒤 같은 턴에서 화자 레이블 없이
+# 곧장 학습자의 답/풀이를 이어 쓰는 경우가 있다(_SpeakerLabelGuard가 못 잡는
+# 구멍). 질문(물음표로 끝나는 줄)을 낸 뒤, 새 줄이 아래의 채점·정답 제시
+# 표현으로 "시작"하면 그 줄부터 컷한다. 줄 시작에서만, 질문 이후에만 발동해
+# 정상 튜터 턴(자체 하위질문 등)을 자르지 않도록 보수적으로 잡는다.
+_SELF_ANSWER_RE = re.compile(
+    r"^\s*(?:"
+    r"맞아요?|맞았|정답(?:은|이)?|정확(?:해|히|합니다)?|그렇지|그래 맞|잘했|훌륭"
+    r"|좋아(?:요)?[,，.]|바로 그거|네,? 맞|응,? 맞"
+    r")",
+)
+
+# 튜터가 학습자에게 "직접 해보라"고 넘긴 줄의 끝 패턴. 물음표뿐 아니라 한국어
+# 권유·명령형 종결("~해봐", "~구해봐", "~풀어봐", "~볼까", "~보자")로도 학습자
+# 차례를 넘긴다. 이런 줄 뒤에 자문자답 가드를 arm한다.
+_LEARNER_PROMPT_END_RE = re.compile(
+    r"(?:[?？]"
+    r"|(?:해|풀어|구해|찾아|세워|답해|적어|계산해|만들어|골라)\s*봐(?:요)?"
+    r"|보자|볼까)\s*[.!~。…]*$",
+)
+
 
 def build_messages(
     session: SessionLike,
@@ -300,7 +336,9 @@ async def stream_turn(
     speaker = _SpeakerLabelGuard()
     cut = False
 
-    async for delta in client.stream(model=model, messages=messages, temperature=0.4):
+    async for delta in client.stream(
+        model=model, messages=messages, temperature=0.4, stop=_STOP_SEQUENCES
+    ):
         buffer += delta
         # 지금까지 발견된 완성 sentinel을 적용 (chapter dict를 mutate).
         buffer, frames, did_change = _drain_sentinels(buffer, chapter)
@@ -455,19 +493,30 @@ class _LoopGuard:
 class _SpeakerLabelGuard:
     """튜터가 학습자를 연기하기 시작하면 스트림을 자른다.
 
-    튜터는 질문하고 멈춰야 한다. 대신 학습자 답을 조작할 때, 그 환각 턴은 거의
-    항상 화자 레이블("user", "학습자:", "assistant", "튜터:", ...)로 시작한다.
-    보이는 텍스트를 순서대로 받아 그런 레이블로 시작하는 첫 줄에서 ``hit=True``를
-    돌려주고 그 줄 앞 텍스트만 방출한다 — 질문까지의 진짜 튜터 턴. 이후는 버림.
-    (learning 그대로.)
+    튜터는 질문하고 멈춰야 한다. 대신 학습자 답을 조작할 때 두 가지 형태가 있다:
+
+    1. **레이블 형태** (learning 그대로): 환각 턴이 화자 레이블("user",
+       "학습자:", "assistant", "튜터:", ...)로 시작한다. 그런 레이블로 시작하는
+       첫 줄에서 컷한다.
+    2. **레이블 없는 형태** (paper-learning 추가): 질문을 던진 뒤 같은 턴에서
+       레이블 없이 곧장 학습자의 답/풀이를 이어 쓰고 스스로 채점·진행한다.
+       질문(물음표로 끝나는 줄) 이후, (a) 빈 줄로 분리된 새 문단이 시작되거나
+       (b) 채점·정답 제시 표현(_SELF_ANSWER_RE)으로 시작하는 줄이 오면 컷한다.
+
+    둘 다 그 줄 앞 텍스트(질문까지의 진짜 튜터 턴)만 방출하고 이후는 버린다.
+    (2)는 휴리스틱이라 질문 이후·줄 시작에서만 보수적으로 발동해, 설명 중간의
+    수사적 질문 바로 뒤 한 호흡("왜? 바로 ~때문이야") 같은 정상 패턴은
+    빈 줄이 없으면 자르지 않는다. API stop 시퀀스·프롬프트 규칙과 병행하는
+    최종 방어선이다.
     """
 
     def __init__(self) -> None:
-        self._pending = ""  # 아직 개행 안 된 현재 줄
+        self._pending = ""          # 아직 개행 안 된 현재 줄
+        self._armed = False         # 직전에 질문(물음표 종료 줄)을 냈는가
+        self._blank_since_q = False # 질문 이후 빈 줄을 봤는가
 
     def feed(self, text: str) -> tuple[str, bool]:
-        """(방출가능_텍스트, hit) 반환. hit 시 방출엔 문제의 화자레이블 줄 앞
-        텍스트만 담긴다."""
+        """(방출가능_텍스트, hit) 반환. hit 시 방출엔 문제의 줄 앞 텍스트만 담긴다."""
         out: list[str] = []
         i = 0
         n = len(text)
@@ -481,17 +530,39 @@ class _SpeakerLabelGuard:
             line = self._pending + text[i : nl + 1]
             self._pending = ""
             i = nl + 1
-            if _SPEAKER_LABEL_RE.match(line):
+            if self._is_cut_line(line):
                 return "".join(out), True
+            self._update_state(line)
             out.append(line)
         return "".join(out), False
 
     def flush(self) -> str:
         rest, self._pending = self._pending, ""
-        # 보류된 마지막 줄(개행 없음)도 레이블일 수 있다.
-        if _SPEAKER_LABEL_RE.match(rest):
+        # 보류된 마지막 줄(개행 없음)도 가상 화자 턴의 시작일 수 있다.
+        if self._is_cut_line(rest):
             return ""
         return rest
+
+    def _is_cut_line(self, line: str) -> bool:
+        """이 줄에서 잘라야 하는가 (가상 학습자 턴의 시작인가)."""
+        if _SPEAKER_LABEL_RE.match(line):
+            return True
+        stripped = line.strip()
+        if self._armed and stripped:
+            # 질문 뒤 빈 줄로 분리된 새 문단, 또는 채점·정답 제시 표현으로 시작.
+            if self._blank_since_q or _SELF_ANSWER_RE.match(stripped):
+                return True
+        return False
+
+    def _update_state(self, line: str) -> None:
+        """방출이 확정된 줄로 질문/빈줄 상태를 갱신한다."""
+        stripped = line.strip()
+        if self._armed and not stripped:
+            self._blank_since_q = True
+            return
+        if _LEARNER_PROMPT_END_RE.search(stripped):
+            self._armed = True
+            self._blank_since_q = False
 
 
 def _split_safe(buffer: str) -> tuple[str, str]:

@@ -73,6 +73,7 @@ class LLMClient:
         messages: list[Message],
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        stop: list[str] | None = None,
     ) -> str:
         """Non-streaming completion. Retries transient failures. Returns text."""
         payload: dict[str, Any] = {
@@ -82,6 +83,8 @@ class LLMClient:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if stop:
+            payload["stop"] = stop
 
         last_err: Exception | None = None
         for attempt in range(self._max_retries + 1):
@@ -122,6 +125,7 @@ class LLMClient:
         messages: list[Message],
         temperature: float = 0.4,
         max_tokens: int | None = None,
+        stop: list[str] | None = None,
     ) -> AsyncIterator[str]:
         """Stream completion tokens as text deltas (single attempt)."""
         payload: dict[str, Any] = {
@@ -132,6 +136,8 @@ class LLMClient:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if stop:
+            payload["stop"] = stop
 
         try:
             async with self._client.stream(
